@@ -15,6 +15,8 @@ permissions:
   pull-requests: read
   issues: read
 
+engine: codex
+
 network: defaults
 
 tools:
