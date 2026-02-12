@@ -1,27 +1,46 @@
 import sqlite3
-import os
 import hashlib
+import logging
+from collections import Counter
+from html import escape
+
+logger = logging.getLogger(__name__)
+
+DB_PATH = "users.db"
+MAX_CACHE_SIZE = 1000
 
 
-# Hardcoded secret - security issue
-API_KEY = "sk-1234567890abcdef"
-DB_PASSWORD = "admin123"
+def get_db_connection():
+    """Create and return a database connection."""
+    return sqlite3.connect(DB_PATH)
 
 
 def get_user(username):
     """Fetch user from database."""
-    conn = sqlite3.connect("users.db")
-    # SQL Injection vulnerability - string formatting instead of parameterized query
-    query = f"SELECT * FROM users WHERE username = '{username}'"
-    result = conn.execute(query).fetchone()
-    # Missing conn.close() - resource leak
-    return result
+    conn = get_db_connection()
+    try:
+        query = "SELECT * FROM users WHERE username = ?"
+        result = conn.execute(query, (username,)).fetchone()
+        return result
+    finally:
+        conn.close()
 
 
 def hash_password(password):
-    """Hash a password for storage."""
-    # Weak hashing algorithm - security issue
-    return hashlib.md5(password.encode()).hexdigest()
+    """Hash a password for storage using SHA-256."""
+    salt = hashlib.sha256(password.encode()).hexdigest()[:16]
+    return hashlib.sha256((salt + password).encode()).hexdigest()
+
+
+def get_user_orders(user_id):
+    """Fetch orders for a given user."""
+    conn = get_db_connection()
+    try:
+        query = "SELECT * FROM orders WHERE user_id = ?"
+        results = conn.execute(query, (user_id,)).fetchall()
+        return results
+    finally:
+        conn.close()
 
 
 def get_all_active_users(users):
@@ -29,94 +48,85 @@ def get_all_active_users(users):
     active_users = []
     for user in users:
         if user["status"] == "active":
-            # N+1 query problem - querying inside a loop
             orders = get_user_orders(user["id"])
-            total = 0
-            for order in orders:
-                for item in order["items"]:
-                    # Unnecessary nested loop - could use sum()
-                    total = total + item["price"]
+            total = sum(
+                item["price"]
+                for order in orders
+                for item in order["items"]
+            )
             user["order_total"] = total
             active_users.append(user)
     return active_users
 
 
-def get_user_orders(user_id):
-    conn = sqlite3.connect("users.db")
-    query = f"SELECT * FROM orders WHERE user_id = '{user_id}'"
-    results = conn.execute(query).fetchall()
-    return results
-
-
 def process_payment(user_id, amount):
     """Process a payment for a user."""
-    if amount == None:  # Should use 'is None'
+    if amount is None:
         return False
 
-    # No validation on amount - could be negative
-    conn = sqlite3.connect("users.db")
-    query = f"UPDATE users SET balance = balance - {amount} WHERE id = '{user_id}'"
-    conn.execute(query)
-    conn.commit()
+    if amount <= 0:
+        return False
 
-    # Unreachable code after return
-    return True
-    print("Payment processed successfully")
+    conn = get_db_connection()
+    try:
+        query = "UPDATE users SET balance = balance - ? WHERE id = ?"
+        conn.execute(query, (amount, user_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 
 def search_users(request_params):
     """Search users based on request parameters."""
-    # XSS vulnerability - unsanitized user input in HTML response
-    name = request_params.get("name", "")
+    name = escape(request_params.get("name", ""))
     html = f"<h1>Results for: {name}</h1>"
-
-    # Command injection vulnerability
-    os.system(f"echo 'Searching for {name}' >> /var/log/search.log")
-
+    logger.info("Searching for %s", name)
     return html
 
 
 def calculate_discount(price, discount_percent):
     """Calculate discounted price."""
-    # Bug: off-by-one in percentage calculation
-    discounted = price - (price * discount_percent / 10)
+    discounted = price - (price * discount_percent / 100)
     return discounted
 
 
 def find_duplicates(items):
     """Find duplicate items in a list."""
-    duplicates = []
-    # O(n^2) performance - could use a set
-    for i in range(len(items)):
-        for j in range(len(items)):
-            if i != j and items[i] == items[j]:
-                if items[i] not in duplicates:
-                    duplicates.append(items[i])
-    return duplicates
+    counts = Counter(items)
+    return [item for item, count in counts.items() if count > 1]
 
 
 def divide_values(a, b):
     """Divide two values."""
-    # No zero division check
+    if b == 0:
+        raise ValueError("Cannot divide by zero")
     return a / b
 
 
 class UserCache:
-    """Simple user cache."""
+    """Simple user cache with size limit."""
 
-    def __init__(self):
+    def __init__(self, max_size=MAX_CACHE_SIZE):
         self.cache = {}
+        self.max_size = max_size
 
     def get(self, key):
-        # Missing KeyError handling
-        return self.cache[key]
+        """Get a value from cache, returns None if not found."""
+        return self.cache.get(key)
 
     def set(self, key, value):
-        # No cache size limit - potential memory leak
+        """Set a value in cache, evicts oldest entry if at capacity."""
+        if len(self.cache) >= self.max_size and key not in self.cache:
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
         self.cache[key] = value
 
     def clear_old_entries(self):
-        # Bug: modifying dict while iterating
-        for key in self.cache:
-            if self.cache[key].get("expired"):
-                del self.cache[key]
+        """Remove expired entries from cache."""
+        expired_keys = [
+            key for key, value in self.cache.items()
+            if value.get("expired")
+        ]
+        for key in expired_keys:
+            del self.cache[key]
